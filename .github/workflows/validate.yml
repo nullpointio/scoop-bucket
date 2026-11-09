@@ -1,0 +1,84 @@
+name: validate
+
+on:
+  pull_request:
+    paths:
+      - "bucket/**.json"
+      - ".github/workflows/validate.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bucket/**.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install validator dependencies
+        run: python -m pip install --quiet jsonschema
+
+      - name: Validate manifests against the Scoop schema
+        run: |
+          curl -fsSL -o /tmp/scoop-schema.json \
+            https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json
+          python - <<'PY'
+          import glob, json, sys
+          from jsonschema import Draft7Validator
+
+          schema = json.load(open("/tmp/scoop-schema.json"))
+          validator = Draft7Validator(schema)
+          failed = False
+          for path in sorted(glob.glob("bucket/*.json")):
+              doc = json.load(open(path))
+              errors = sorted(validator.iter_errors(doc), key=lambda e: list(e.path))
+              if errors:
+                  failed = True
+                  print(f"::error file={path}::schema validation failed")
+                  for err in errors:
+                      print(f"  {list(err.path)}: {err.message}")
+              else:
+                  print(f"{path}: schema OK ({doc['version']})")
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Verify every url/hash against the live release asset
+        run: |
+          python - <<'PY'
+          import glob, hashlib, json, re, sys, urllib.request
+
+          failed = False
+          for path in sorted(glob.glob("bucket/*.json")):
+              doc = json.load(open(path))
+              url, expected = doc["url"], doc["hash"].lower()
+              with urllib.request.urlopen(url, timeout=120) as resp:
+                  digest = hashlib.sha256(resp.read()).hexdigest()
+              if digest != expected:
+                  failed = True
+                  print(f"::error file={path}::sha256 mismatch for {url}")
+                  print(f"  manifest {expected}")
+                  print(f"  actual   {digest}")
+                  continue
+              print(f"{path}: sha256 OK {digest}")
+
+              # The autoupdate rule must be able to find that same hash in SHA256SUMS.txt.
+              sums_url = doc["autoupdate"]["hash"]["url"].replace("$version", doc["version"])
+              sums = urllib.request.urlopen(sums_url, timeout=60).read().decode("utf-8", "replace")
+              match = re.search(doc["autoupdate"]["hash"]["regex"], sums, re.M)
+              if not match or match.group(1).lower() != expected:
+                  failed = True
+                  print(f"::error file={path}::autoupdate hash regex does not find the expected hash in {sums_url}")
+              else:
+                  print(f"{path}: autoupdate hash rule OK")
+          sys.exit(1 if failed else 0)
+          PY
